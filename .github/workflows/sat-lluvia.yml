@@ -1,7 +1,5 @@
 name: Lluvia satelital (NOAA GOES-19)
 on:
-  schedule:
-    - cron: '*/10 * * * *'
   workflow_dispatch:
 concurrency:
   group: sat-lluvia
