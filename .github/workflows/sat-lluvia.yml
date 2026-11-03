@@ -1,0 +1,21 @@
+name: Lluvia satelital (NOAA GOES-19)
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+concurrency:
+  group: sat-lluvia
+  cancel-in-progress: true
+jobs:
+  sat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install numpy requests xarray h5netcdf h5py fsspec aiohttp
+      - run: python scripts/sat_lluvia.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
