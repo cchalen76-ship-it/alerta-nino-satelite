@@ -1,0 +1,7 @@
+numpy
+xarray
+requests
+fsspec
+aiohttp
+h5netcdf
+h5py
