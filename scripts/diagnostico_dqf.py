@@ -1,40 +1,36 @@
 #!/usr/bin/env python3
 # =====================================================
-# AlertA-Niño: DIAGNÓSTICO v2 (de una sola vez, no guarda nada en Neon)
+# AlertA-Niño: DIAGNÓSTICO v3 (de una sola vez, no guarda nada en Neon)
 #
-# Pregunta que responde: ¿por qué TODOS los puntos de nuestra zona salen con DQF 3 y valor -999?
-#   a) ¿Nuestra proyección apunta al píxel equivocado?  -> se compara con las Latitude/Longitude del propio archivo.
-#   b) ¿O de verdad no hay estimación sobre la zona?     -> se mira una ventana grande alrededor, a resolución completa.
-# Reutiliza listar_ultimo(), abrir(), proyectar() e indice_en_eje() de sat_lluvia.py (misma carpeta scripts/).
+# Hipótesis a comprobar: los ejes x e y del archivo NO vienen en radianes (son 0..5423), así que nuestra
+# fórmula mandaba TODOS los puntos al píxel (0,0), una esquina vacía del satélite (DQF 3 y -999).
+# Se comprueba de tres formas independientes:
+#   1. Se imprimen los ejes x e y tal como vienen.
+#   2. Se busca el píxel de Guayaquil usando las Latitude/Longitude 2D del propio archivo (no depende de fórmulas).
+#   3. Se calcula el píxel con las constantes estándar de la rejilla GOES-R 2 km y se compara con (2).
+# Reutiliza listar_ultimo(), abrir(), parametros() y proyectar() de sat_lluvia.py (misma carpeta scripts/).
 # =====================================================
 import logging
 import sys
+import warnings
 
 import numpy as np
 
 import sat_lluvia as s
 
 log = logging.getLogger('diagnostico')
+warnings.simplefilter('ignore')
+# Constantes estándar de la rejilla fija GOES-R de 2 km (ángulo de escaneo en radianes por píxel)
+ESC, OFF = 5.6e-5, 0.151844
+GYE = (-2.19, -79.89)          # centro de Guayaquil
 
 
 def bloque(ds, nombre, y0, y1, x0, x1):
-    """Lee un rectángulo de una variable 2D como matriz [fila(y), columna(x)], sea cual sea el orden de sus ejes."""
+    """Rectángulo de una variable 2D como matriz [fila, columna]."""
     v = ds[nombre]
     d0, d1 = v.dims[-2:]
     a = v.isel({d0: slice(int(y0), int(y1) + 1), d1: slice(int(x0), int(x1) + 1)}).values.astype('float64')
     return a.T if d0 == 'x' else a
-
-
-def indices(ds, lats, lons):
-    """Píxel (iy, ix) de cada punto lat/lon con nuestra fórmula."""
-    p = s.parametros(ds)
-    xs, ys = ds['x'].values.astype('float64'), ds['y'].values.astype('float64')
-    LAT, LON = np.meshgrid(lats, lons, indexing='ij')
-    with np.errstate(invalid='ignore', divide='ignore'):
-        x, y, vis = s.proyectar(LAT, LON, p)
-        ix, iy = s.indice_en_eje(xs, x), s.indice_en_eje(ys, y)
-    dentro = vis & (ix >= 0) & (ix < xs.size) & (iy >= 0) & (iy < ys.size)
-    return LAT, LON, ix, iy, dentro
 
 
 def por_codigo(etiqueta, dq, rr):
@@ -42,9 +38,8 @@ def por_codigo(etiqueta, dq, rr):
     cod, n = np.unique(dq[np.isfinite(dq)], return_counts=True)
     log.info('%s | histograma DQF: %s', etiqueta, {str(c): int(k) for c, k in zip(cod, n)})
     for c in cod:
-        v = rr[dq == c]
-        fin = v[np.isfinite(v)]
-        log.info('%s | DQF=%s | píxeles=%d | mínimo=%s | máximo=%s | con lluvia>=2: %d', etiqueta, c, v.size,
+        fin = rr[(dq == c) & np.isfinite(rr)]
+        log.info('%s | DQF=%s | píxeles=%d | mínimo=%s | máximo=%s | con lluvia>=2: %d', etiqueta, c, fin.size,
                  fin.min() if fin.size else None, fin.max() if fin.size else None, int((fin >= 2).sum()))
 
 
@@ -52,44 +47,51 @@ def main():
     clave = s.listar_ultimo()
     log.info('Archivo: %s', clave)
     with s.abrir(clave) as ds:
-        log.info('DQF significado COMPLETO: %s', ds['DQF'].attrs.get('long_name'))
-        log.info('Dimensiones de RRQPE: %s | Latitude: %s | Longitude: %s', ds['RRQPE'].dims,
-                 ds['Latitude'].dims if 'Latitude' in ds else None, ds['Longitude'].dims if 'Longitude' in ds else None)
+        # ---- 1. Los ejes tal como vienen ----
+        log.info('Coordenadas del dataset: %s | goes_imager_projection presente: %s', list(ds.coords), 'goes_imager_projection' in ds.variables)
+        for n in ('x', 'y'):
+            v = ds[n].values
+            log.info('Eje %s: tipo=%s | primeros=%s | últimos=%s | atributos=%s', n, v.dtype, v[:3], v[-3:], dict(ds[n].attrs))
+        N = ds.sizes['x']
 
-        # ---- A) Nuestra rejilla: ¿el píxel elegido está donde creemos? ----
+        # ---- 2. Píxel de Guayaquil según las Latitude/Longitude del archivo (búsqueda gruesa, 1 de cada 8) ----
+        k = 8
+        la_n, lo_n = ds['Latitude'], ds['Longitude']
+        d0, d1 = la_n.dims
+        la = la_n.isel({d0: slice(None, None, k), d1: slice(None, None, k)}).values.astype('float64')
+        lo = lo_n.isel({d0: slice(None, None, k), d1: slice(None, None, k)}).values.astype('float64')
+        dist = (la - GYE[0]) ** 2 + ((lo - GYE[1]) * np.cos(np.radians(GYE[0]))) ** 2
+        dist = np.where(np.isfinite(dist), dist, np.inf)
+        f, c = np.unravel_index(dist.argmin(), dist.shape)
+        log.info('REFERENCIA del archivo: Guayaquil está cerca del píxel fila=%d columna=%d (±%d) | su lat/lon=%.3f, %.3f',
+                 f * k, c * k, k, la[f, c], lo[f, c])
+
+        # ---- 3. Mismo punto con las constantes estándar y con nuestra fórmula ----
+        xs_std = -OFF + ESC * np.arange(N)
+        ys_std = OFF - ESC * np.arange(N)
+        p = s.parametros(ds)
+        x, y, vis = s.proyectar(np.array(GYE[0]), np.array(GYE[1]), p)
+        log.info('Ángulos de escaneo de Guayaquil: x=%.5f y=%.5f rad | visible=%s', x, y, bool(vis))
+        ix_std, iy_std = int(s.indice_en_eje(xs_std, np.array([x]))[0]), int(s.indice_en_eje(ys_std, np.array([y]))[0])
+        ix_arch, iy_arch = int(s.indice_en_eje(ds['x'].values.astype('float64'), np.array([x]))[0]), int(s.indice_en_eje(ds['y'].values.astype('float64'), np.array([y]))[0])
+        log.info('PÍXEL con constantes estándar: fila=%d columna=%d | PÍXEL con los ejes del archivo (lo que usa hoy el script): fila=%d columna=%d',
+                 iy_std, ix_std, iy_arch, ix_arch)
+
+        # ---- 4. Prueba de fuego: error de latitud/longitud en nuestros 380 puntos con las constantes estándar ----
         lats = np.arange(s.LAT_MIN, s.LAT_MAX + s.PASO / 2, s.PASO)
         lons = np.arange(s.LON_MIN, s.LON_MAX + s.PASO / 2, s.PASO)
-        LAT, LON, ix, iy, dentro = indices(ds, lats, lons)
-        y0, y1, x0, x1 = iy[dentro].min(), iy[dentro].max(), ix[dentro].min(), ix[dentro].max()
+        LAT, LON = np.meshgrid(lats, lons, indexing='ij')
+        with np.errstate(invalid='ignore', divide='ignore'):
+            xx, yy, vv = s.proyectar(LAT, LON, p)
+            ix, iy = s.indice_en_eje(xs_std, xx), s.indice_en_eje(ys_std, yy)
+        ok = vv & (ix >= 0) & (ix < N) & (iy >= 0) & (iy < N)
+        y0, y1, x0, x1 = iy[ok].min(), iy[ok].max(), ix[ok].min(), ix[ok].max()
         jy, jx = np.clip(iy, y0, y1) - y0, np.clip(ix, x0, x1) - x0
-        try:
-            la = bloque(ds, 'Latitude', y0, y1, x0, x1)[jy, jx]
-            lo = bloque(ds, 'Longitude', y0, y1, x0, x1)[jy, jx]
-            el, eo = np.abs(la - LAT), np.abs(lo - LON)
-            log.info('MAPEO: error medio lat=%.4f° lon=%.4f° | error máximo lat=%.4f° lon=%.4f° (más de 0.05° = proyección mal)',
-                     np.nanmean(el), np.nanmean(eo), np.nanmax(el), np.nanmax(eo))
-        except Exception as e:
-            log.warning('No se pudo comparar con Latitude/Longitude del archivo: %s: %s', type(e).__name__, str(e)[:150])
-        dq = bloque(ds, 'DQF', y0, y1, x0, x1)[jy, jx]
-        rr = bloque(ds, 'RRQPE', y0, y1, x0, x1)[jy, jx]
-        por_codigo('NUESTRA ZONA (380 puntos)', dq, rr)
-        for n in ('solar_zenith_angle', 'retrieval_local_zenith_angle'):
-            try:
-                a = bloque(ds, n, y0, y1, x0, x1)[jy, jx]
-                log.info('%s en nuestra zona: mínimo=%.1f máximo=%.1f', n, np.nanmin(a), np.nanmax(a))
-            except Exception as e:
-                log.info('%s: no se pudo leer (%s)', n, type(e).__name__)
-
-        # ---- B) Ventana grande a resolución completa: costa de Ecuador y mar cercano ----
-        for nombre, (la0, la1, lo0, lo1) in {'VENTANA 2°x2° alrededor de Guayaquil': (-3.2, -1.2, -80.9, -78.9),
-                                              'VENTANA 8°x10° (Ecuador, Perú norte, Pacífico)': (-6.0, 2.0, -85.0, -75.0)}.items():
-            g1, g2 = np.arange(la0, la1, 0.05), np.arange(lo0, lo1, 0.05)
-            _, _, bx, by, ok = indices(ds, g1, g2)
-            if not ok.any():
-                log.info('%s: fuera de vista', nombre)
-                continue
-            a, b, c, d = by[ok].min(), by[ok].max(), bx[ok].min(), bx[ok].max()
-            por_codigo(nombre, bloque(ds, 'DQF', a, b, c, d), bloque(ds, 'RRQPE', a, b, c, d))
+        el = np.abs(bloque(ds, 'Latitude', y0, y1, x0, x1)[jy, jx] - LAT)
+        eo = np.abs(bloque(ds, 'Longitude', y0, y1, x0, x1)[jy, jx] - LON)
+        log.info('MAPEO con constantes estándar: puntos con coordenada válida=%d de %d | error lat medio=%.4f° máx=%.4f° | error lon medio=%.4f° máx=%.4f° (bien si < 0.05°)',
+                 int(np.isfinite(el).sum()), el.size, np.nanmean(el), np.nanmax(el), np.nanmean(eo), np.nanmax(eo))
+        por_codigo('NUESTRA ZONA con mapeo estándar', bloque(ds, 'DQF', y0, y1, x0, x1)[jy, jx], bloque(ds, 'RRQPE', y0, y1, x0, x1)[jy, jx])
 
 
 if __name__ == '__main__':
