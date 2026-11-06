@@ -51,10 +51,11 @@ PASO = _env('PASO', 0.02, float)                               # separación ent
 EDAD_MAX_MIN = _env('EDAD_MAX_MIN', 40.0, float)               # más viejo que esto = no se guarda
 HORAS_BUSQUEDA = 4                                             # cuántas horas hacia atrás se busca un archivo
 # REGLAS FIJAS (no son configurables a propósito: cambiarlas cambia el significado de los datos de alerta):
-#  - NOAA asigna a cada píxel sobre la Tierra un valor de 0 a 100 mm/h, así que un NaN significa "sin dato", nunca "no llueve".
-#  - Códigos DQF aceptados como dato usable. SUPUESTO por convención GOES-R (0 = bueno, 1 = usable con reservas):
-#    se confirma con la línea "Códigos DQF en el área" del primer log.
-DQF_VALIDOS = (0, 1)
+#  - El cielo despejado llega como 0.0 con DQF 0 (verificado en el diagnóstico del disco completo). El relleno es -999.0:
+#    un valor negativo significa "sin dato", nunca "no llueve".
+#  - DQF NO es una lista de códigos: es una máscara de bits. El bit 0 = "recuperación de lluvia mala" (valor 1).
+#    Verificado: los códigos con ese bit (3) traen -999; los demás (0, 2, 64, 66) traen lluvia real, así que se aceptan.
+BIT_RECUPERACION_MALA = 1
 MM_MAX_VALIDO = 300.0                                          # margen amplio: un valor mayor es un error, no una tormenta
 MAX_PUNTOS = 5000                                              # tope de seguridad del tamaño de la rejilla
 # Rutas posibles del bucket: calendario (AAAA/MM/DD/HH) o día juliano (AAAA/JJJ/HH)
@@ -228,7 +229,11 @@ def muestrear(ds):
     # Clasificación de cada punto: ¿hay dato fiable o no?
     nan = ~np.isfinite(valores)
     absurdo = ~nan & ((valores < 0) | (valores >= MM_MAX_VALIDO))
-    dqf_malo = ~np.isin(calidad, DQF_VALIDOS) if calidad is not None else np.zeros(valores.shape, dtype=bool)
+    if calidad is not None:
+        cod = np.where(np.isfinite(calidad), calidad, 0).astype(int)
+        dqf_malo = ~np.isfinite(calidad) | ((cod & BIT_RECUPERACION_MALA) != 0)    # sin código, o bit 0 encendido
+    else:
+        dqf_malo = np.zeros(valores.shape, dtype=bool)
     sin_dato = ~dentro | dqf_malo | absurdo | nan                   # un NaN nunca se convierte en 0.0
     mm = np.where(sin_dato, np.nan, valores)                        # NaN aquí solo marca "sin dato" (luego será null en el JSON)
 
@@ -292,7 +297,7 @@ def main():
     log.info('Variable de lluvia: %s | calidad: %s', rejilla['variable'], st['dqf_var'] or 'NO EXISTE')
     log.info('Puntos: %d | con dato: %d (%.0f%%) | sin dato: fuera de vista=%d, calidad mala=%d, valor absurdo=%d | NaN=%d',
              st['puntos'], st['con_dato'], rejilla['cobertura'] * 100, st['fuera_de_vista'], st['dqf_malo'], st['absurdo'], st['nan'])
-    log.info('Códigos DQF en el área: %s | aceptados: %s', st['dqf_hist'], list(DQF_VALIDOS))
+    log.info('Códigos DQF en el área: %s | se descarta si el bit 0 está encendido', st['dqf_hist'])
     log.info('Puntos con lluvia >= 2 mm/h: %d | máximo: %.1f mm/h', sum(v >= 2 for v in con_dato), max(con_dato, default=0.0))
     guardar(escaneo, rejilla)
 
