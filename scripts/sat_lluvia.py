@@ -60,8 +60,11 @@ MM_MAX_VALIDO = 300.0                                          # margen amplio: 
 MAX_PUNTOS = 5000                                              # tope de seguridad del tamaño de la rejilla
 # Rutas posibles del bucket: calendario (AAAA/MM/DD/HH) o día juliano (AAAA/JJJ/HH)
 FORMATOS_RUTA = ('%Y/%m/%d/%H', '%Y/%j/%H')
-# Valores por defecto de la órbita de GOES-Este (solo si el archivo no trae su proyección)
-PROY_DEFECTO = {'req': 6378137.0, 'rpol': 6356752.31414, 'h': 35786023.0, 'lam0': -75.2}
+# Este producto NO trae su proyección, así que se usan estos valores. VERIFICADO contra las Latitude/Longitude del archivo:
+# sus coordenadas corresponden a un satélite en -75.0° (con -75.2° el error era de 0.2° de longitud, ~11 píxeles).
+PROY_DEFECTO = {'req': 6378137.0, 'rpol': 6356752.31414, 'h': 35786023.0, 'lam0': -75.0}
+OFF_REJILLA = 0.151844                                         # ángulo (rad) del borde de la rejilla fija GOES-R de disco completo
+TOLERANCIA_MAPEO_GRADOS = 0.06                                 # si el píxel elegido se aleja más que esto del punto pedido, se aborta
 
 
 # ---------- 1. Buscar el archivo más reciente ----------
@@ -196,11 +199,45 @@ def indice_en_eje(eje, valores):
     return np.where(np.isfinite(idx), idx, -1).astype(int)
 
 
+def ejes(ds):
+    """Ejes de escaneo en radianes. Este producto trae x e y como ÍNDICES 0..N-1 (sin unidades), no como ángulos:
+    en ese caso se reconstruyen con la rejilla fija estándar de GOES-R. (Antes se usaban tal cual y TODOS los puntos
+    caían en el píxel 0,0 = espacio vacío: la lluvia por satélite nunca midió nada.)"""
+    xs, ys = ds['x'].values.astype('float64'), ds['y'].values.astype('float64')
+    if max(np.abs(xs).max(), np.abs(ys).max()) <= 1.0:
+        return xs, ys                                          # ya vienen en radianes
+    paso = 2 * OFF_REJILLA / (xs.size - 1)
+    return -OFF_REJILLA + paso * np.arange(xs.size), OFF_REJILLA - paso * np.arange(ys.size)
+
+
+def verificar_mapeo(ds, LAT, LON, dentro, y0, y1, x0, x1, jy, jx):
+    """Comprueba con las Latitude/Longitude del propio archivo que cada punto cayó en el píxel correcto.
+    Si el error es grande ABORTA: mejor no guardar nada que guardar la lluvia de otro lugar. Devuelve el peor error (grados)."""
+    if 'Latitude' not in ds.variables or 'Longitude' not in ds.variables:
+        log.warning('El archivo no trae Latitude/Longitude: no se pudo verificar el mapeo')
+        return None
+
+    def rect(nombre):
+        v = ds[nombre]
+        d0, d1 = v.dims[-2:]
+        a = v.isel({d0: slice(int(y0), int(y1) + 1), d1: slice(int(x0), int(x1) + 1)}).values.astype('float64')
+        return (a.T if d0 == 'x' else a)[jy, jx]
+
+    err = np.maximum(np.abs(rect('Latitude') - LAT), np.abs(rect('Longitude') - LON))[dentro]
+    err = err[np.isfinite(err)]
+    if err.size == 0:
+        raise RuntimeError('Ningún punto tiene Latitude/Longitude válida: el mapeo a píxeles está mal')
+    peor = float(err.max())
+    if peor > TOLERANCIA_MAPEO_GRADOS:
+        raise RuntimeError(f'Mapeo inválido: el píxel elegido está hasta {peor:.3f}° del punto pedido (máximo {TOLERANCIA_MAPEO_GRADOS}°)')
+    return round(peor, 4)
+
+
 def muestrear(ds):
     """Devuelve (rejilla, estadísticas). Fila 0 = latitud más al sur, columna 0 = longitud más al oeste.
     En 'mm': número = lluvia (0.0 = hay dato y no llueve); None = SIN INFORMACIÓN."""
     nombre, nom_dqf, p = variable_lluvia(ds), variable_calidad(ds), parametros(ds)
-    xs, ys = ds['x'].values.astype('float64'), ds['y'].values.astype('float64')
+    xs, ys = ejes(ds)
     lats = np.arange(LAT_MIN, LAT_MAX + PASO / 2, PASO)
     lons = np.arange(LON_MIN, LON_MAX + PASO / 2, PASO)
     if lats.size * lons.size > MAX_PUNTOS:
@@ -225,6 +262,7 @@ def muestrear(ds):
 
     valores = leer(nombre)
     calidad = leer(nom_dqf) if nom_dqf else None
+    error_mapeo = verificar_mapeo(ds, LAT, LON, dentro, y0, y1, x0, x1, jy, jx)   # aborta si el mapeo está mal
 
     # Clasificación de cada punto: ¿hay dato fiable o no?
     nan = ~np.isfinite(valores)
@@ -241,7 +279,7 @@ def muestrear(ds):
         'puntos': int(mm.size), 'con_dato': int((~sin_dato).sum()), 'fuera_de_vista': int((~dentro).sum()),
         'dqf_malo': int((dentro & dqf_malo).sum()), 'absurdo': int((dentro & absurdo).sum()), 'nan': int((dentro & nan).sum()),
         'dqf_hist': {str(k): int(v) for k, v in zip(*np.unique(calidad[dentro], return_counts=True))} if calidad is not None else None,
-        'dqf_var': nom_dqf,
+        'dqf_var': nom_dqf, 'error_mapeo': error_mapeo,
     }
     rejilla = {
         'variable': nombre, 'dqf': nom_dqf,
@@ -294,7 +332,8 @@ def main():
     rejilla['generado'] = dt.datetime.now(dt.timezone.utc).isoformat()   # el frontend calcula la edad con 'escaneo'
 
     con_dato = [v for fila in rejilla['mm'] for v in fila if v is not None]
-    log.info('Variable de lluvia: %s | calidad: %s', rejilla['variable'], st['dqf_var'] or 'NO EXISTE')
+    log.info('Variable de lluvia: %s | calidad: %s | error máximo de mapeo vs Latitude/Longitude del archivo: %s°',
+             rejilla['variable'], st['dqf_var'] or 'NO EXISTE', st['error_mapeo'])
     log.info('Puntos: %d | con dato: %d (%.0f%%) | sin dato: fuera de vista=%d, calidad mala=%d, valor absurdo=%d | NaN=%d',
              st['puntos'], st['con_dato'], rejilla['cobertura'] * 100, st['fuera_de_vista'], st['dqf_malo'], st['absurdo'], st['nan'])
     log.info('Códigos DQF en el área: %s | se descarta si el bit 0 está encendido', st['dqf_hist'])
