@@ -1,19 +1,32 @@
 name: Lluvia satelital (NOAA GOES-19)
+
+# Solo se ejecuta cuando alguien lo dispara (cron-job.org cada 10 min, o el botón "Run workflow")
 on:
   workflow_dispatch:
+
+# Si llega un disparo nuevo mientras uno corre, se cancela el viejo y queda el más reciente
 concurrency:
   group: sat-lluvia
   cancel-in-progress: true
+
 jobs:
   sat:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install numpy requests xarray h5netcdf h5py fsspec aiohttp
-      - run: python scripts/sat_lluvia.py
+          cache: pip                      # guarda las librerías entre ejecuciones (lee requirements.txt)
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Leer el satélite y guardar en Neon
+        run: python scripts/sat_lluvia.py
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
