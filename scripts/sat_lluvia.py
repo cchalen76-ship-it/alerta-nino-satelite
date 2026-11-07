@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =====================================================
-# AlertA-Niño: lluvia estimada por satélite (NOAA Enterprise Rain Rate, GOES-19)  ·  v2
+# AlertA-Niño: lluvia estimada por satélite (NOAA Enterprise Rain Rate, GOES-19)  ·  v3
 #
 # Qué hace, en orden:
 #   1. Busca en el bucket público de NOAA el archivo más reciente (uno cada 10 min, ~68 MB).
@@ -9,6 +9,12 @@
 #   4. Muestrea la lluvia (mm/h) en una rejilla de puntos, distinguiendo "0.0 = no llueve" de
 #      "null = sin información" (fuera de vista, calidad mala, valor inválido).
 #   5. Guarda la rejilla en Neon (tabla lluvia_sat) para que la app la lea vía /api/lluvia-sat.
+#
+# Novedades de la v3 (NO cambian lo que se guarda en Neon):
+#   - Diagnóstico de calidad en el log: significado de los códigos DQF/PQI según el propio archivo y,
+#     por cada código, cuántos puntos hay, cuántos con lluvia y el máximo. Sirve para decidir con evidencia
+#     si algún código de calidad debe descartarse.
+#   - Estadísticas calculadas con NumPy (sin recorrer listas) y reintentos ante fallos de red (listado y Neon).
 #
 # Variable obligatoria para guardar: DATABASE_URL (si falta, solo muestra el resultado = modo prueba).
 # Variables opcionales (todas con valor por defecto; vacías = se usa el defecto):
@@ -23,6 +29,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import datetime as dt
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
@@ -55,9 +62,13 @@ HORAS_BUSQUEDA = 4                                             # cuántas horas 
 #    un valor negativo significa "sin dato", nunca "no llueve".
 #  - DQF NO es una lista de códigos: es una máscara de bits. El bit 0 = "recuperación de lluvia mala" (valor 1).
 #    Verificado: los códigos con ese bit (3) traen -999; los demás (0, 2, 64, 66) traen lluvia real, así que se aceptan.
+#    OJO: "traen lluvia real" significa que traen un valor numérico, no que sea fiable. El diagnóstico de la v3 (log)
+#    muestra qué significa cada código y cuánta lluvia reporta cada uno.
 BIT_RECUPERACION_MALA = 1
 MM_MAX_VALIDO = 300.0                                          # margen amplio: un valor mayor es un error, no una tormenta
 MAX_PUNTOS = 5000                                              # tope de seguridad del tamaño de la rejilla
+UMBRAL_LOG_MM = 2.0                                            # solo para estadísticas del log: mismo umbral de llovizna que usa la app
+TOP_CODIGOS_LOG = 12                                           # máximo de códigos de calidad que se listan en el log
 # Rutas posibles del bucket: calendario (AAAA/MM/DD/HH) o día juliano (AAAA/JJJ/HH)
 FORMATOS_RUTA = ('%Y/%m/%d/%H', '%Y/%j/%H')
 # Este producto NO trae su proyección, así que se usan estos valores. VERIFICADO contra las Latitude/Longitude del archivo:
@@ -67,19 +78,38 @@ OFF_REJILLA = 0.151844                                         # ángulo (rad) d
 TOLERANCIA_MAPEO_GRADOS = 0.06                                 # si el píxel elegido se aleja más que esto del punto pedido, se aborta
 
 
+# ---------- 0. Utilidad de red ----------
+def con_reintento(fn, intentos=3, espera=2.0):
+    """Ejecuta fn(); si falla por un error de red (timeout, conexión, HTTP), reintenta con espera creciente.
+    El último fallo se propaga tal cual. Los errores de lógica (no son de red) no se reintentan."""
+    for n in range(1, intentos + 1):
+        try:
+            return fn()
+        except requests.RequestException as e:
+            if n == intentos:
+                raise
+            log.warning('Fallo de red (%s); reintento %d/%d en %.0f s', type(e).__name__, n, intentos - 1, espera * n)
+            time.sleep(espera * n)
+
+
 # ---------- 1. Buscar el archivo más reciente ----------
 def listar_ultimo():
     """Devuelve la clave del archivo más nuevo; mira la hora UTC actual y hasta HORAS_BUSQUEDA-1 horas atrás.
     Prueba las dos formas de carpeta y deja en el log cuál funcionó."""
     ns = {'s3': 'http://s3.amazonaws.com/doc/2006-03-01/'}
     ahora = dt.datetime.now(dt.timezone.utc)
+
+    def pedir(prefijo):
+        r = requests.get(BUCKET + '/', params={'list-type': '2', 'prefix': prefijo}, timeout=30)
+        r.raise_for_status()
+        return r.content
+
     for atras in range(HORAS_BUSQUEDA):
         h = ahora - dt.timedelta(hours=atras)
         for formato in FORMATOS_RUTA:
             prefijo = f'{PREFIJO}/{h.strftime(formato)}/'
-            r = requests.get(BUCKET + '/', params={'list-type': '2', 'prefix': prefijo}, timeout=30)
-            r.raise_for_status()
-            claves = [e.text for e in ET.fromstring(r.content).findall('s3:Contents/s3:Key', ns)
+            contenido = con_reintento(lambda: pedir(prefijo))
+            claves = [e.text for e in ET.fromstring(contenido).findall('s3:Contents/s3:Key', ns)
                       if e.text and e.text.endswith('.nc')]
             if claves:
                 log.info('Carpeta con formato %s', formato)
@@ -233,6 +263,37 @@ def verificar_mapeo(ds, LAT, LON, dentro, y0, y1, x0, x1, jy, jx):
     return round(peor, 4)
 
 
+# ---------- 3b. Diagnóstico de calidad (solo informa; no afecta lo que se guarda) ----------
+def atributos_calidad(ds, nombre):
+    """Lo que el propio archivo dice de una variable de calidad (significado de sus códigos). Texto recortado."""
+    a = ds[nombre].attrs
+    return {k: str(a[k])[:400] for k in ('long_name', 'flag_values', 'flag_masks', 'flag_meanings', 'comment') if k in a}
+
+
+def desglose(codigos, valores, dentro):
+    """Por cada código de calidad: cuántos puntos, cuántos con lluvia >= UMBRAL_LOG_MM y el máximo.
+    Solo cuenta puntos dentro de la imagen y con valor válido (>= 0); el relleno -999 no entra."""
+    ok = dentro & np.isfinite(valores) & (valores >= 0) & np.isfinite(codigos)
+    filas = []
+    for c in np.unique(codigos[ok]):
+        v = valores[ok & (codigos == c)]
+        filas.append({'codigo': int(c), 'n': int(v.size), 'con_lluvia': int((v >= UMBRAL_LOG_MM).sum()), 'max': round(float(v.max()), 1)})
+    return sorted(filas, key=lambda f: -f['n'])
+
+
+def registrar_diagnostico(diag):
+    """Escribe el diagnóstico en el log: atributos de DQF/PQI y el desglose por código."""
+    if not diag:
+        return
+    if diag.get('error'):
+        log.warning('Diagnóstico de calidad incompleto: %s', diag['error'])
+    for nombre, attrs in (diag.get('attrs') or {}).items():
+        log.info('Atributos de %s según el archivo: %s', nombre, json.dumps(attrs, ensure_ascii=False))
+    for clave, etiqueta in (('dqf', 'DQF'), ('pqi', 'PQI')):
+        for f in (diag.get(clave) or [])[:TOP_CODIGOS_LOG]:
+            log.info('%s %s: %d puntos | %d con lluvia >= %.0f mm/h | máx %.1f mm/h', etiqueta, f['codigo'], f['n'], f['con_lluvia'], UMBRAL_LOG_MM, f['max'])
+
+
 def muestrear(ds):
     """Devuelve (rejilla, estadísticas). Fila 0 = latitud más al sur, columna 0 = longitud más al oeste.
     En 'mm': número = lluvia (0.0 = hay dato y no llueve); None = SIN INFORMACIÓN."""
@@ -264,7 +325,7 @@ def muestrear(ds):
     calidad = leer(nom_dqf) if nom_dqf else None
     error_mapeo = verificar_mapeo(ds, LAT, LON, dentro, y0, y1, x0, x1, jy, jx)   # aborta si el mapeo está mal
 
-    # Clasificación de cada punto: ¿hay dato fiable o no?
+    # Clasificación de cada punto: ¿hay dato fiable o no? (reglas fijas, ver arriba)
     nan = ~np.isfinite(valores)
     absurdo = ~nan & ((valores < 0) | (valores >= MM_MAX_VALIDO))
     if calidad is not None:
@@ -275,17 +336,32 @@ def muestrear(ds):
     sin_dato = ~dentro | dqf_malo | absurdo | nan                   # un NaN nunca se convierte en 0.0
     mm = np.where(sin_dato, np.nan, valores)                        # NaN aquí solo marca "sin dato" (luego será null en el JSON)
 
+    # Diagnóstico de calidad: nunca debe romper la ejecución, por eso va protegido
+    diag = {}
+    try:
+        diag['attrs'] = {n: atributos_calidad(ds, n) for n in (nom_dqf, 'PQI') if n and n in ds.data_vars}
+        if calidad is not None:
+            diag['dqf'] = desglose(calidad, valores, dentro)
+        if 'PQI' in ds.data_vars:
+            diag['pqi'] = desglose(leer('PQI'), valores, dentro)
+    except Exception as e:                                          # el diagnóstico es opcional
+        diag['error'] = f'{type(e).__name__}: {str(e)[:150]}'
+
+    con_dato = int((~sin_dato).sum())
+    with np.errstate(invalid='ignore'):
+        n_lluvia = int((mm >= UMBRAL_LOG_MM).sum())                 # los NaN comparan como False
     stats = {
-        'puntos': int(mm.size), 'con_dato': int((~sin_dato).sum()), 'fuera_de_vista': int((~dentro).sum()),
+        'puntos': int(mm.size), 'con_dato': con_dato, 'fuera_de_vista': int((~dentro).sum()),
         'dqf_malo': int((dentro & dqf_malo).sum()), 'absurdo': int((dentro & absurdo).sum()), 'nan': int((dentro & nan).sum()),
         'dqf_hist': {str(k): int(v) for k, v in zip(*np.unique(calidad[dentro], return_counts=True))} if calidad is not None else None,
         'dqf_var': nom_dqf, 'error_mapeo': error_mapeo,
+        'n_lluvia': n_lluvia, 'max_mm': float(np.nanmax(mm)) if con_dato else 0.0, 'diag': diag,
     }
     rejilla = {
         'variable': nombre, 'dqf': nom_dqf,
         'lat0': round(float(lats[0]), 4), 'lon0': round(float(lons[0]), 4), 'paso': PASO,
         'filas': int(lats.size), 'cols': int(lons.size),
-        'cobertura': round(stats['con_dato'] / stats['puntos'], 3),    # fracción de puntos con información
+        'cobertura': round(con_dato / stats['puntos'], 3),             # fracción de puntos con información
         'mm': [[None if np.isnan(v) else round(float(v), 1) for v in fila] for fila in mm],
     }
     return rejilla, stats
@@ -299,16 +375,15 @@ def guardar(escaneo, rejilla):
         log.info('Sin DATABASE_URL: no se guarda (modo prueba).')
         return
     host = urlparse(url).hostname
-    r = requests.post(
+    cuerpo = {
+        'query': 'INSERT INTO lluvia_sat (id, escaneo, rejilla) VALUES (1, $1::timestamptz, $2::jsonb) '
+                 'ON CONFLICT (id) DO UPDATE SET escaneo = EXCLUDED.escaneo, rejilla = EXCLUDED.rejilla, actualizado_en = now()',
+        'params': [escaneo.isoformat(), json.dumps(rejilla, allow_nan=False)],   # allow_nan=False: nunca sale un NaN inválido
+    }
+    r = con_reintento(lambda: requests.post(
         f'https://{host}/sql',
         headers={'Content-Type': 'application/json', 'Neon-Connection-String': url},
-        json={
-            'query': 'INSERT INTO lluvia_sat (id, escaneo, rejilla) VALUES (1, $1::timestamptz, $2::jsonb) '
-                     'ON CONFLICT (id) DO UPDATE SET escaneo = EXCLUDED.escaneo, rejilla = EXCLUDED.rejilla, actualizado_en = now()',
-            'params': [escaneo.isoformat(), json.dumps(rejilla, allow_nan=False)],   # allow_nan=False: nunca sale un NaN inválido
-        },
-        timeout=30,
-    )
+        json=cuerpo, timeout=30))
     if not r.ok:
         raise RuntimeError(f'Neon respondió {r.status_code}: {r.text[:300]}')
     log.info('Guardado en Neon.')
@@ -331,13 +406,15 @@ def main():
         rejilla, st = muestrear(ds)
     rejilla['generado'] = dt.datetime.now(dt.timezone.utc).isoformat()   # el frontend calcula la edad con 'escaneo'
 
-    con_dato = [v for fila in rejilla['mm'] for v in fila if v is not None]
+    pct_lluvia = 100 * st['n_lluvia'] / st['con_dato'] if st['con_dato'] else 0
     log.info('Variable de lluvia: %s | calidad: %s | error máximo de mapeo vs Latitude/Longitude del archivo: %s°',
              rejilla['variable'], st['dqf_var'] or 'NO EXISTE', st['error_mapeo'])
     log.info('Puntos: %d | con dato: %d (%.0f%%) | sin dato: fuera de vista=%d, calidad mala=%d, valor absurdo=%d | NaN=%d',
              st['puntos'], st['con_dato'], rejilla['cobertura'] * 100, st['fuera_de_vista'], st['dqf_malo'], st['absurdo'], st['nan'])
     log.info('Códigos DQF en el área: %s | se descarta si el bit 0 está encendido', st['dqf_hist'])
-    log.info('Puntos con lluvia >= 2 mm/h: %d | máximo: %.1f mm/h', sum(v >= 2 for v in con_dato), max(con_dato, default=0.0))
+    log.info('Puntos con lluvia >= %.0f mm/h: %d de %d con dato (%.0f%%) | máximo: %.1f mm/h',
+             UMBRAL_LOG_MM, st['n_lluvia'], st['con_dato'], pct_lluvia, st['max_mm'])
+    registrar_diagnostico(st['diag'])
     guardar(escaneo, rejilla)
 
 
